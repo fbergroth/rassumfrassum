@@ -81,7 +81,7 @@ You can add more servers on top of a preset using `--` separators.
 For example, to add [codebook][codebook] for spell checking:
 
 ```bash
-rass python -- codebook-lsp server
+rass python -- codebook-lsp serve
 ```
 
 ### Bundled presets
