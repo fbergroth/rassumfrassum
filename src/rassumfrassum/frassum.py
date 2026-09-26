@@ -128,9 +128,9 @@ class LspLogic:
 
         # initialize goes to all servers
         elif method == 'initialize':
-            doccaps = params['capabilities']['textDocument']
+            doc_caps = params['capabilities']['textDocument']
             # Check for client $streamingDiagnostics capability
-            if doccaps.pop('$streamingDiagnostics', None):
+            if doc_caps.pop('$streamingDiagnostics', None):
                 self.opts.stream_diagnostics = True
 
                 info("Client requested streaming diagnostics mode")
@@ -143,7 +143,7 @@ class LspLogic:
             if self.opts.stream_diagnostics:
                 # TODO: also force versionSupport in the
                 # publishDiagnostics cap.
-                doccaps['diagnostic'] = {'dynamicRegistration': False}
+                doc_caps['diagnostic'] = {'dynamicRegistration': False}
             return servers
 
         # shutdown goes to all servers
@@ -472,7 +472,7 @@ class LspLogic:
         if method == 'initialize':
             if 'name' in payload.get('serverInfo', {}):
                 server.name = payload['serverInfo']['name']
-            caps = payload.get('capabilities')
+            caps = payload.get('capabilities', {})
             server.caps = caps.copy() if caps else {}
 
             # index the commands of "executeCommandProvider"
