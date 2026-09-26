@@ -3,20 +3,23 @@ LSP-specific message routing and merging logic.
 """
 
 import asyncio
+import difflib
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from functools import reduce
 from pathlib import PurePosixPath
-from typing import cast, Callable, Awaitable, Optional
+from typing import Optional, cast
 from urllib.parse import unquote, urlparse
 
 from .json import JSON
 from .util import (
-    dmerge,
-    is_scalar,
     debug,
-    info,
+    dmerge,
     expand_braces,
+    info,
+    is_scalar,
+    warn,
 )
 
 
@@ -27,6 +30,8 @@ class Server:
     name: str
     caps: JSON = field(default_factory=dict)
     cookie: object = None
+    # textDocumentSync kind (0/1/2), or None if unknown
+    sync_kind: int | None = None
 
 
 @dataclass
@@ -87,6 +92,8 @@ class LspLogic:
         self.opts = opts
         # Track document state: URI -> DocumentState
         self.document_state: dict[str, DocumentState] = {}
+        # Mirror of the full text of open documents: URI -> text
+        self.document_text: dict[str, str] = {}
         # Map server ID to server object for data recovery
         self.servers: dict[int, Server] = {id(s): s for s in servers}
         # Stash for lean identifiers: lean_id -> (payload, original_data, server)
@@ -258,18 +265,34 @@ class LspLogic:
                 return state
 
         if method == 'textDocument/didClose':
-            reset_state(params["textDocument"]["uri"], None)
+            uri = params["textDocument"]["uri"]
+            self.document_text.pop(uri, None)
+            reset_state(uri, None)
             await forward_all()
-        elif method in ('textDocument/didOpen', 'textDocument/didChange'):
+        elif method == 'textDocument/didOpen':
             uri = params["textDocument"]["uri"]
             v = params["textDocument"]["version"]
             state = reset_state(uri, v)
+            self.document_text[uri] = params["textDocument"].get("text", "")
             await forward_all()
             # In streaming mode, pull diagnostics from pull-capable servers
             if self.opts.stream_diagnostics:
-                await self._pull_and_stream_diags(
-                    uri, state, method == 'textDocument/didChange'
-                )
+                await self._pull_and_stream_diags(uri, state, False)
+        elif method == 'textDocument/didChange':
+            uri = params["textDocument"]["uri"]
+            v = params["textDocument"]["version"]
+            state = reset_state(uri, v)
+            await self._forward_did_change(
+                uri, v, params.get("contentChanges", [])
+            )
+            # In streaming mode, pull diagnostics from pull-capable servers
+            if self.opts.stream_diagnostics:
+                await self._pull_and_stream_diags(uri, state, True)
+        elif method == 'textDocument/didSave':
+            uri = params["textDocument"]["uri"]
+            if (text := params.get('text')) is not None:
+                self.document_text[uri] = text
+            await forward_all()
         elif method == 'workspace/didChangeWatchedFiles' and (
             changes := params.get("changes")
         ):
@@ -284,6 +307,56 @@ class LspLogic:
                         break
         else:
             await forward_all()
+
+    async def _forward_did_change(
+        self, uri: str, version: JSON, content_changes: JSON
+    ) -> None:
+        """Forward client didChange, translating sync kind per server.
+
+        Full-sync servers get the whole text computed from our mirror;
+        incremental servers get ranged changes (the client's verbatim,
+        or a diff if the client sent a range-less full change, which
+        some incremental servers can't take).
+        """
+        old_text = self.document_text.get(uri, "")
+        try:
+            new_text = _apply_content_changes(old_text, content_changes)
+        except (KeyError, IndexError, TypeError):
+            warn(f"Malformed content changes for {uri}; dropping didChange")
+            return
+        self.document_text[uri] = new_text
+
+        text_doc = {'uri': uri, 'version': version}
+        full_params = {
+            'textDocument': text_doc,
+            'contentChanges': [{'text': new_text}],
+        }
+        verbatim_params = {
+            'textDocument': text_doc,
+            'contentChanges': content_changes,
+        }
+        diff_changes = None
+
+        for server in self.servers.values():
+            kind = server.sync_kind
+            if kind == 1:
+                params = full_params
+            elif kind == 2:
+                if any('range' not in c for c in content_changes):
+                    if diff_changes is None:
+                        diff_changes = _diff_changes(old_text, new_text)
+                    if not diff_changes:
+                        continue
+                    params = {
+                        'textDocument': text_doc,
+                        'contentChanges': diff_changes,
+                    }
+                else:
+                    params = verbatim_params
+            else:
+                # Unknown sync kind: forward verbatim (historical behavior)
+                params = verbatim_params
+            await self.notify_server(server, 'textDocument/didChange', params)
 
     async def on_client_response(
         self,
@@ -475,6 +548,12 @@ class LspLogic:
             caps = payload.get('capabilities', {})
             server.caps = caps.copy() if caps else {}
 
+            # Parse text sync kind for per-server didChange translation
+            if sync := caps.get('textDocumentSync'):
+                server.sync_kind = (
+                    sync.get('change') if isinstance(sync, dict) else sync
+                )
+
             # index the commands of "executeCommandProvider"
             if (p := caps.get("executeCommandProvider")) and (
                 cmds := p.get("commands")
@@ -576,9 +655,29 @@ class LspLogic:
                 ),
                 {},
             )
+            if is_error:
+                return (res, is_error)
+            res = cast(JSON, res)
+
             # In streaming mode, advertise our custom streaming capability
-            if self.opts.stream_diagnostics and not is_error:
+            if self.opts.stream_diagnostics:
                 res['capabilities']['$streamingDiagnosticsProvider'] = True
+
+            # Decide the text sync kind advertised to the client (#55).
+            # Prefer incremental when any server needs it; didChange is
+            # translated per server in _forward_did_change.
+            kinds = {s.sync_kind for s in self.servers.values()} - {None, 0}
+            if (
+                kinds
+                and (caps := cast(JSON, res.get('capabilities')))
+                and (sync := caps.get('textDocumentSync'))
+            ):
+                chosen = 2 if 2 in kinds else 1
+                caps['textDocumentSync'] = (
+                    {**sync, 'change': chosen}
+                    if isinstance(sync, dict)
+                    else {'change': chosen, 'openClose': True}
+                )
 
         elif method == 'shutdown':
             res = {}
@@ -646,16 +745,9 @@ class LspLogic:
 
         for cap, newval in new.items():
 
-            def t1sync(x):
-                return x == 1 or (isinstance(x, dict) and x.get("change") == 1)
-
-            if res.get(cap) is None:
-                res[cap] = newval
-            elif cap == 'textDocumentSync' and t1sync(newval):
-                res[cap] = newval
-            elif is_scalar(newval) and res.get(cap) is None:
-                res[cap] = newval
-            elif is_scalar(res.get(cap)) and not is_scalar(newval):
+            if res.get(cap) is None or (
+                is_scalar(res.get(cap)) and not is_scalar(newval)
+            ):
                 res[cap] = newval
             elif (
                 isinstance(res.get(cap), dict)
@@ -818,6 +910,84 @@ class LspLogic:
     def _stash_diagnostics_data(self, diags, source, state):
         for diag in diags:
             self._stash_data(diag, source, state)
+
+
+def _utf16_offset(s: str, u16_index: int) -> int:
+    """Convert a UTF-16 code unit offset to a Python string index.
+
+    LSP positions are UTF-16 code unit offsets (rass forces
+    positionEncodings to utf-16); Python indexes by code point."""
+    if u16_index <= 0:
+        return 0
+    if s[:u16_index].isascii():
+        # ASCII fast path: offsets coincide
+        return min(u16_index, len(s))
+    units = 0
+    for i, c in enumerate(s):
+        if units >= u16_index:
+            return i
+        units += 2 if ord(c) > 0xFFFF else 1
+    return len(s)
+
+
+def _lsp_position(text: str, pos: JSON) -> int:
+    """Python index for an LSP position (UTF-16 line/character).
+
+    Positions beyond the document are clamped to the document end
+    (same as VSCode's TextDocument.offsetAt)."""
+    line_start = 0
+    for _ in range(cast(int, pos['line'])):
+        nl = text.find('\n', line_start)
+        if nl < 0:
+            return len(text)
+        line_start = nl + 1
+    nl = text.find('\n', line_start)
+    line_text = text[line_start:] if nl < 0 else text[line_start:nl]
+    return line_start + _utf16_offset(line_text, cast(int, pos['character']))
+
+
+def _apply_content_changes(text: str, changes: JSON) -> str:
+    """Apply LSP didChange contentChanges to text, returning new text.
+
+    Changes are sequential state changes: c1 is computed on the
+    original state, c2 on the state after c1, and so on.  A change
+    without a 'range' replaces the whole document."""
+    for change in cast(list, changes):
+        new = change.get('text', '')
+        if (r := change.get('range')) is None:
+            return new
+        start = _lsp_position(text, r['start'])
+        end = _lsp_position(text, r['end'])
+        text = text[:start] + new + text[end:]
+    return text
+
+
+def _diff_changes(old: str, new: str) -> list[JSON]:
+    """Compute line-based ranged contentChanges transforming old into new.
+
+    Ranges are rebased so that applying the changes in order (see
+    _apply_content_changes) yields new."""
+    old_lines = old.splitlines(keepends=True)
+    new_lines = new.splitlines(keepends=True)
+    matcher = difflib.SequenceMatcher(
+        None, old_lines, new_lines, autojunk=False
+    )
+    changes = []
+    line_delta = 0
+    for op, i1, i2, j1, j2 in matcher.get_opcodes():
+        if op == 'equal':
+            continue
+        changes.append(
+            {
+                'range': {
+                    'start': {'line': i1 + line_delta, 'character': 0},
+                    'end': {'line': i2 + line_delta, 'character': 0},
+                },
+                'text': ''.join(new_lines[j1:j2]),
+            }
+        )
+        line_delta += (j2 - j1) - (i2 - i1)
+    return changes
 
 
 def _add_source_attribution(diags, server):
