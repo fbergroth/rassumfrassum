@@ -35,10 +35,12 @@ class Server:
 
 
 @dataclass
-class DocumentState:
-    """State for tracking diagnostics for a document."""
+class LspDocument:
+    """Represents an LSP document."""
 
+    uri: str
     docver: int
+    text: str = ""
     stashed_items: set[int] = field(
         default_factory=set
     )  # lean_ids of stashed completion/codeAction items
@@ -91,9 +93,7 @@ class LspLogic:
         self.notify_server = notify_server
         self.opts = opts
         # Track document state: URI -> DocumentState
-        self.document_state: dict[str, DocumentState] = {}
-        # Mirror of the full text of open documents: URI -> text
-        self.document_text: dict[str, str] = {}
+        self.document_state: dict[str, LspDocument] = {}
         # Map server ID to server object for data recovery
         self.servers: dict[int, Server] = {id(s): s for s in servers}
         # Stash for lean identifiers: lean_id -> (payload, original_data, server)
@@ -236,62 +236,74 @@ class LspLogic:
             for server in self.servers.values():
                 await self.notify_server(server, method, params)
 
-        def reset_state(uri: str, version: Optional[int]):
-            """Reset document state. If version is None, close the document."""
+        def close_state(uri: str) -> None:
+            """Close document tracking for uri, if tracked."""
             if state := self.document_state.get(uri):
                 if state.push_diags_timer:
                     state.push_diags_timer.cancel()
                 # Clean up stashed items for this document
                 for lean_id in state.stashed_items:
                     self.stash.pop(lean_id, None)
-                if version is not None:
+                self.document_state.pop(uri, None)
+
+        def reset_state(uri: str, version: int | None) -> LspDocument:
+            """Reset document state for a new version.
+
+            Always returns a DocumentState: if version isn't an
+            integer, warn and keep the document as-is.
+            """
+            if state := self.document_state.get(uri):
+                if state.push_diags_timer:
+                    state.push_diags_timer.cancel()
+                # Clean up stashed items for this document
+                for lean_id in state.stashed_items:
+                    self.stash.pop(lean_id, None)
+                if isinstance(version, int):
                     # Preserve inflight_pulls in streaming mode
                     old_pulls = (
                         state.inflight_pulls
                         if self.opts.stream_diagnostics
                         else {}
                     )
-                    # Replace with fresh state
-                    state = DocumentState(docver=version)
+                    # Replace with fresh state, keeping the text mirror
+                    state = LspDocument(uri=uri, docver=version, text=state.text)
                     state.inflight_pulls.update(old_pulls)
                     self.document_state[uri] = state
-                    return state
-                else:
-                    self.document_state.pop(uri, None)
-                    return None
-            elif version is not None:
-                state = DocumentState(docver=version)
-                self.document_state[uri] = state
                 return state
+            state = LspDocument(
+                uri=uri, docver=version if isinstance(version, int) else 0
+            )
+            self.document_state[uri] = state
+            return state
 
         if method == 'textDocument/didClose':
             uri = params["textDocument"]["uri"]
-            self.document_text.pop(uri, None)
-            reset_state(uri, None)
+            close_state(uri)
             await forward_all()
         elif method == 'textDocument/didOpen':
             uri = params["textDocument"]["uri"]
-            v = params["textDocument"]["version"]
-            state = reset_state(uri, v)
-            self.document_text[uri] = params["textDocument"].get("text", "")
+            state = reset_state(uri, params["textDocument"].get("version"))
+            state.text = params["textDocument"].get("text", "")
             await forward_all()
             # In streaming mode, pull diagnostics from pull-capable servers
             if self.opts.stream_diagnostics:
                 await self._pull_and_stream_diags(uri, state, False)
         elif method == 'textDocument/didChange':
             uri = params["textDocument"]["uri"]
-            v = params["textDocument"]["version"]
-            state = reset_state(uri, v)
+            state = reset_state(uri, params["textDocument"].get("version"))
             await self._forward_did_change(
-                uri, v, params.get("contentChanges", [])
+                state, params.get("contentChanges", [])
             )
             # In streaming mode, pull diagnostics from pull-capable servers
             if self.opts.stream_diagnostics:
                 await self._pull_and_stream_diags(uri, state, True)
         elif method == 'textDocument/didSave':
             uri = params["textDocument"]["uri"]
-            if (text := params.get('text')) is not None:
-                self.document_text[uri] = text
+            if (state := self.document_state.get(uri)) and (
+                (text := params.get('text')) is not None
+            ):
+                state.text = text
+
             await forward_all()
         elif method == 'workspace/didChangeWatchedFiles' and (
             changes := params.get("changes")
@@ -309,7 +321,7 @@ class LspLogic:
             await forward_all()
 
     async def _forward_did_change(
-        self, uri: str, version: JSON, content_changes: JSON
+        self, state: LspDocument, content_changes: JSON
     ) -> None:
         """Forward client didChange, translating sync kind per server.
 
@@ -318,15 +330,18 @@ class LspLogic:
         or a diff if the client sent a range-less full change, which
         some incremental servers can't take).
         """
-        old_text = self.document_text.get(uri, "")
+        old_text = state.text
         try:
             new_text = _apply_content_changes(old_text, content_changes)
         except (KeyError, IndexError, TypeError):
-            warn(f"Malformed content changes for {uri}; dropping didChange")
+            warn(
+                f"Malformed content changes for {state.uri}; dropping didChange"
+            )
             return
-        self.document_text[uri] = new_text
+        state.text = new_text
 
-        text_doc = {'uri': uri, 'version': version}
+        # state.docver was bumped to this change's version by reset_state
+        text_doc = {'uri': state.uri, 'version': state.docver}
         full_params = {
             'textDocument': text_doc,
             'contentChanges': [{'text': new_text}],
@@ -744,7 +759,6 @@ class LspLogic:
         new = payload.get('capabilities', {})
 
         for cap, newval in new.items():
-
             if res.get(cap) is None or (
                 is_scalar(res.get(cap)) and not is_scalar(newval)
             ):
@@ -819,9 +833,7 @@ class LspLogic:
 
         return aggregate + result
 
-    def _stash_data(
-        self, payload: JSON, server: Server, doc_state: DocumentState
-    ):
+    def _stash_data(self, payload: JSON, server: Server, doc_state: LspDocument):
         """Stash data field with lean identifier.  Mutate payload."""
         # Stash original data (or None) and server, replace with lean id
         original_data = payload.get('data')
@@ -832,7 +844,7 @@ class LspLogic:
         # Track lean_id in document state for cleanup
         doc_state.stashed_items.add(lean_id)
 
-    def _pushdiags_complete(self, state: DocumentState) -> bool:
+    def _pushdiags_complete(self, state: LspDocument) -> bool:
         """Check if diagnostic aggregation is complete for a document."""
         # Don't send empty aggregations - need at least one push diagnostic
         if not state.inflight_pushes:
@@ -842,7 +854,7 @@ class LspLogic:
             state.inflight_pushes.keys() | state.inflight_pulls.keys()
         ) == self.servers.keys()
 
-    async def _publish_pushdiags(self, uri: str, state: DocumentState) -> None:
+    async def _publish_pushdiags(self, uri: str, state: LspDocument) -> None:
         """Send aggregated diagnostics to the client."""
         state.push_dispatched = True
         if state.push_diags_timer:
@@ -866,7 +878,7 @@ class LspLogic:
         uri is the URI that motivated this.
         """
 
-        async def doit(server: Server, uri: str, state: DocumentState):
+        async def doit(server: Server, uri: str, state: LspDocument):
             is_error, pull_response = await self.request_server(
                 server,
                 'textDocument/diagnostic',
