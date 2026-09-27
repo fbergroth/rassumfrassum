@@ -266,13 +266,11 @@ class LspLogic:
                         else {}
                     )
                     # Replace with fresh state, keeping the text mirror
-                    state = LspDocument(uri=uri, docver=version, text=state.text)
+                    state = LspDocument(uri, version, state.text)
                     state.inflight_pulls.update(old_pulls)
                     self.document_state[uri] = state
                 return state
-            state = LspDocument(
-                uri=uri, docver=version if isinstance(version, int) else 0
-            )
+            state = LspDocument(uri, version if isinstance(version, int) else 0)
             self.document_state[uri] = state
             return state
 
@@ -394,7 +392,9 @@ class LspLogic:
                 new_item = generic
                 if isinstance(rass, dict):
                     for pattern, overlay in rass.items():
-                        if re.search(pattern, server.name) and isinstance(overlay, dict):
+                        if re.search(pattern, server.name) and isinstance(
+                            overlay, dict
+                        ):
                             new_item = dmerge(overlay, generic)
                             break
                 items[i] = new_item
@@ -739,7 +739,9 @@ class LspLogic:
             new_init_opts = generic_opts
             if isinstance(rass, dict):
                 for pattern, overlay in rass.items():
-                    if re.search(pattern, server.name) and isinstance(overlay, dict):
+                    if re.search(pattern, server.name) and isinstance(
+                        overlay, dict
+                    ):
                         new_init_opts = dmerge(overlay, generic_opts)
                         break
             params = {**params, 'initializationOptions': new_init_opts}
@@ -833,7 +835,9 @@ class LspLogic:
 
         return aggregate + result
 
-    def _stash_data(self, payload: JSON, server: Server, doc_state: LspDocument):
+    def _stash_data(
+        self, payload: JSON, server: Server, doc_state: LspDocument
+    ):
         """Stash data field with lean identifier.  Mutate payload."""
         # Stash original data (or None) and server, replace with lean id
         original_data = payload.get('data')
