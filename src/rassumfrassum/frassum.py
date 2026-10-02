@@ -919,9 +919,9 @@ class LspLogic:
             # servers.
             asyncio.create_task(doit(server, orig_uri, state))
             if include_neighbours:
-                for uri, state in self.documents.items():
+                for uri, other in self.documents.items():
                     if uri != orig_uri:
-                        asyncio.create_task(doit(server, uri, state))
+                        asyncio.create_task(doit(server, uri, other))
 
     def _stash_diagnostics_data(self, diags, source, state):
         for diag in diags:
