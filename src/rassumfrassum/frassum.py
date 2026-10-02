@@ -913,12 +913,15 @@ class LspLogic:
                 await self.notify_client('$/streamDiagnostics', params)
 
         for server in self.servers.values():
-            if not server.caps.get('diagnosticProvider'):
+            if not (provider := server.caps.get('diagnosticProvider')):
                 continue
             # Use as background task to avoid blocking other
             # servers.
             asyncio.create_task(doit(server, orig_uri, state))
-            if include_neighbours:
+            # Neighbours can only change if the server's diagnostics
+            # depend on other files.
+            inter_file = provider.get('interFileDependencies', True)
+            if include_neighbours and inter_file:
                 for uri, other in self.documents.items():
                     if uri != orig_uri:
                         asyncio.create_task(doit(server, uri, other))

@@ -6,13 +6,14 @@ from rassumfrassum.test2 import run_toy_server
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--name', required=True)
+parser.add_argument('--inter-file', action='store_true')
 args = parser.parse_args()
 
 run_toy_server(
     name=args.name,
     capabilities={
         'diagnosticProvider': {
-            'interFileDependencies': True,
+            'interFileDependencies': args.inter_file,
             'workspaceDiagnostics': False,
         },
     },

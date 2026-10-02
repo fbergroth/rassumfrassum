@@ -32,8 +32,8 @@ async def main():
         'textDocument': {'uri': A, 'version': 1},
         'contentChanges': [{'text': 'boom'}],
     })
-    got = await reports(client, 4)
-    assert {g for g in got if g[0] == A} == {(A, 1, 's1'), (A, 1, 's2')}, got
+    got = await reports(client, 3)
+    assert got == {(A, 1, 's1'), (A, 1, 's2'), (B, 0, 's1')}, got
 
     await client.byebye()
 
