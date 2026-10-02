@@ -4,6 +4,7 @@ LSP-specific message routing and merging logic.
 
 import asyncio
 import difflib
+import json
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -52,6 +53,9 @@ class LspDocument:
     inflight_pulls: dict[int, str | int] = field(
         default_factory=dict
     )  # server_id -> previousResultId
+    neighbour_diags: dict[int, int] = field(
+        default_factory=dict
+    )  # server_id -> hash of last diagnostics streamed as a neighbour
 
 
 @dataclass
@@ -882,7 +886,9 @@ class LspLogic:
         uri is the URI that motivated this.
         """
 
-        async def doit(server: Server, uri: str, state: LspDocument):
+        async def doit(
+            server: Server, uri: str, state: LspDocument, *, is_origin=False
+        ):
             is_error, pull_response = await self.request_server(
                 server,
                 'textDocument/diagnostic',
@@ -894,11 +900,21 @@ class LspLogic:
 
             if is_error:
                 if pull_response.get('data', {}).get('retriggerRequest'):
-                    await doit(server, uri, state)
+                    await doit(server, uri, state, is_origin=is_origin)
             elif pull_response:
                 resultId = pull_response.get("resultId")
                 state.inflight_pulls[id(server)] = cast(str | int, resultId)
+                kind = pull_response.get('kind')
                 diagnostics = pull_response.get('items', [])
+                # The client keeps a neighbour's diagnostics while its
+                # version doesn't change, so only stream new ones.
+                if not is_origin:
+                    if kind == 'unchanged':
+                        return
+                    digest = hash(json.dumps(diagnostics, sort_keys=True))
+                    if state.neighbour_diags.get(id(server)) == digest:
+                        return
+                    state.neighbour_diags[id(server)] = digest
                 self._stash_diagnostics_data(diagnostics, server, state)
                 _add_source_attribution(diagnostics, server)
                 # Send as streamDiagnostics notification
@@ -906,7 +922,7 @@ class LspLogic:
                     'uri': uri,
                     'version': state.docver,
                     'token': f"{server.name}-{id(server)}",
-                    'kind': pull_response.get('kind'),
+                    'kind': kind,
                 }
                 if diagnostics:
                     params['diagnostics'] = diagnostics
@@ -917,7 +933,7 @@ class LspLogic:
                 continue
             # Use as background task to avoid blocking other
             # servers.
-            asyncio.create_task(doit(server, orig_uri, state))
+            asyncio.create_task(doit(server, orig_uri, state, is_origin=True))
             # Neighbours can only change if the server's diagnostics
             # depend on other files.
             inter_file = provider.get('interFileDependencies', True)
