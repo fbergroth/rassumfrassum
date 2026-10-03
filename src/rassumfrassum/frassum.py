@@ -92,8 +92,8 @@ class LspLogic:
         self.request_server = request_server
         self.notify_server = notify_server
         self.opts = opts
-        # Track document state: URI -> DocumentState
-        self.document_state: dict[str, LspDocument] = {}
+        # Track document state: URI -> LspDocument
+        self.documents: dict[str, LspDocument] = {}
         # Map server ID to server object for data recovery
         self.servers: dict[int, Server] = {id(s): s for s in servers}
         # Stash for lean identifiers: lean_id -> (payload, original_data, server)
@@ -208,7 +208,7 @@ class LspLogic:
             if (
                 (text_doc := params.get('textDocument'))
                 and (uri := text_doc.get('uri'))
-                and (state := self.document_state.get(uri))
+                and (state := self.documents.get(uri))
                 and (targets := [s for s in servers if s.caps.get('diagnosticProvider')])
             ):
                 # Register inflight pulls for all target servers
@@ -238,21 +238,21 @@ class LspLogic:
 
         def close_state(uri: str) -> None:
             """Close document tracking for uri, if tracked."""
-            if state := self.document_state.get(uri):
+            if state := self.documents.get(uri):
                 if state.push_diags_timer:
                     state.push_diags_timer.cancel()
                 # Clean up stashed items for this document
                 for lean_id in state.stashed_items:
                     self.stash.pop(lean_id, None)
-                self.document_state.pop(uri, None)
+                self.documents.pop(uri, None)
 
         def reset_state(uri: str, version: int | None) -> LspDocument:
             """Reset document state for a new version.
 
-            Always returns a DocumentState: if version isn't an
+            Always returns a LspDocument: if version isn't an
             integer, warn and keep the document as-is.
             """
-            if state := self.document_state.get(uri):
+            if state := self.documents.get(uri):
                 if state.push_diags_timer:
                     state.push_diags_timer.cancel()
                 # Clean up stashed items for this document
@@ -268,10 +268,10 @@ class LspLogic:
                     # Replace with fresh state, keeping the text mirror
                     state = LspDocument(uri, version, state.text)
                     state.inflight_pulls.update(old_pulls)
-                    self.document_state[uri] = state
+                    self.documents[uri] = state
                 return state
             state = LspDocument(uri, version if isinstance(version, int) else 0)
-            self.document_state[uri] = state
+            self.documents[uri] = state
             return state
 
         if method == 'textDocument/didClose':
@@ -297,7 +297,7 @@ class LspLogic:
                 await self._pull_and_stream_diags(uri, state, True)
         elif method == 'textDocument/didSave':
             uri = params["textDocument"]["uri"]
-            if (state := self.document_state.get(uri)) and (
+            if (state := self.documents.get(uri)) and (
                 (text := params.get('text')) is not None
             ):
                 state.text = text
@@ -438,7 +438,7 @@ class LspLogic:
         if (
             method == 'textDocument/publishDiagnostics'
             and (uri := params.get('uri'))
-            and (state := self.document_state.get(uri))
+            and (state := self.documents.get(uri))
         ):
             diagnostics = params.get('diagnostics', [])
             self._stash_diagnostics_data(diagnostics, source, state)
@@ -515,7 +515,7 @@ class LspLogic:
         if (
             method == 'textDocument/codeAction'
             and (uri := request_params['textDocument']['uri'])
-            and (doc_state := self.document_state.get(uri))
+            and (doc_state := self.documents.get(uri))
         ):
             for action in cast(list, payload):
                 self._stash_data(action, server, doc_state)
@@ -528,14 +528,14 @@ class LspLogic:
         elif (
             method == 'textDocument/codeAction'
             and (uri := request_params['textDocument']['uri'])
-            and (doc_state := self.document_state.get(uri))
+            and (doc_state := self.documents.get(uri))
         ):
             for action in cast(list, payload):
                 self._stash_data(action, server, doc_state)
         elif (
             method == 'textDocument/diagnostics'
             and (uri := request_params['textDocument']['uri'])
-            and (doc_state := self.document_state.get(uri))
+            and (doc_state := self.documents.get(uri))
         ):
             self._stash_diagnostics_data(
                 payload.get('items', []), server, doc_state
@@ -546,7 +546,7 @@ class LspLogic:
         elif (
             method == 'textDocument/completion'
             and (uri := request_params.get('textDocument', {}).get('uri'))
-            and (doc_state := self.document_state.get(uri))
+            and (doc_state := self.documents.get(uri))
         ):
             items = (
                 payload
@@ -919,7 +919,7 @@ class LspLogic:
             # servers.
             asyncio.create_task(doit(server, orig_uri, state))
             if include_neighbours:
-                for uri, state in self.document_state.items():
+                for uri, state in self.documents.items():
                     if uri != orig_uri:
                         asyncio.create_task(doit(server, uri, state))
 
